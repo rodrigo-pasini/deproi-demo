@@ -63,7 +63,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Protocol
 
-DEPROI_VERSION = "0.1.0"
+DEPROI_VERSION = "0.2.0"
 # Contract marker: the self-update refuses a new version without it, because
 # installing it would switch the self-update off until someone reinstalls by hand.
 SELF_UPDATING = True
@@ -120,6 +120,11 @@ MESSAGES: dict = {
         "step_build": "Build the image {image}:{commit}",
         "step_healthcheck": "Health check of {service}",
         "step_hooks": "Hooks: {point}",
+        "step_dependencies": "Dependencies",
+        "dependencies_none": "No third-party services.",
+        "dependencies_ready": "Running: {services}.",
+        "dependencies_failed": "Third-party services did not start ({services}) — no service of the project was recreated. See the error above.",
+        "health_gave_up": "{service} reported unhealthy {count} times in a row: not waiting any longer.",
         "step_protected": "Protected services",
         "step_recreate": "Recreate the services",
         "step_health": "Wait for {service} to be healthy",
@@ -246,6 +251,11 @@ MESSAGES: dict = {
         "step_build": "Construir a imagem {image}:{commit}",
         "step_healthcheck": "Healthcheck do {service}",
         "step_hooks": "Ganchos: {point}",
+        "step_dependencies": "Dependências",
+        "dependencies_none": "Nenhum serviço de terceiros.",
+        "dependencies_ready": "No ar: {services}.",
+        "dependencies_failed": "Os serviços de terceiros não subiram ({services}) — nenhum serviço do projeto foi recriado. Veja o erro acima.",
+        "health_gave_up": "{service} ficou unhealthy {count} vezes seguidas: não vale esperar mais.",
         "step_protected": "Serviços protegidos",
         "step_recreate": "Recriar os serviços",
         "step_health": "Esperar o {service} ficar saudável",
@@ -881,6 +891,8 @@ class Deploy:
     protected: dict = dataclasses.field(default_factory=dict)
     # up_to_date | updated:<a>:<b> | pending | refused | not_checked
     script: str = "not_checked"
+    # Services running this project's image (<image>:<commit>): the ones a republish force-recreates.
+    own: list = dataclasses.field(default_factory=list)
 
     @property
     def deferred(self) -> list:
@@ -1476,6 +1488,7 @@ def check_definition(cfg: Config, executor: Executor, deploy: Deploy) -> list:
                         variable=cfg.tag_variables[0],
                     ),
                 )
+    deploy.own = [name for name in services if str((data["services"][name] or {}).get("image") or "") == expected]
     return services
 
 
@@ -1518,6 +1531,34 @@ def check_healthcheck(cfg: Config, executor: Executor, deploy: Deploy) -> None:
         write(t("healthcheck_ok", origin="Dockerfile HEALTHCHECK"))
         return
     raise Stop(Situation.REFUSED, t("no_healthcheck", service=cfg.web_service))
+
+
+# --- Dependencies ------------------------------------------------------------------
+
+
+def start_dependencies(cfg: Config, executor: Executor, deploy: Deploy, services: Sequence[str]) -> None:
+    """Third-party services (a database, a cache) must be up before the hooks run on the new image.
+
+    ``up -d --no-recreate --wait``: creates what does not exist yet (the first
+    deploy, a new service) and waits for it to be running and healthy; leaves
+    running containers alone. They are updated with the rest in "recreate".
+    """
+    protected = {p.service for p in cfg.protected}
+    dependencies = [name for name in services if name not in deploy.own and name not in protected]
+    if not dependencies:
+        write(t("dependencies_none"))
+        return
+    result = executor.run(
+        compose_command(cfg, "up", "-d", "--no-recreate", "--wait", *dependencies),
+        cwd=cfg.checkout_path,
+        env=tag_env(cfg, deploy.commit),
+        capture=True,
+        echo=True,
+        timeout=cfg.hook_timeout,
+    )
+    if result.code != 0:
+        raise Stop(Situation.FAILED_NO_CHANGE, t("dependencies_failed", services=", ".join(dependencies)))
+    write(t("dependencies_ready", services=", ".join(dependencies)))
 
 
 # --- Hooks -------------------------------------------------------------------------
@@ -1678,6 +1719,7 @@ def recreate_services(
     joining: Sequence[str],
     force: bool = False,
     definition: str | None = None,
+    own: Sequence[str] = (),
 ) -> bool:
     """``up -d --remove-orphans`` of the definition.
 
@@ -1685,10 +1727,12 @@ def recreate_services(
     joins, a removed one becomes an orphan and is removed. With protected
     services, every other service by name, and the idle protected ones after.
     ``force``: republishing the same commit has the same tag, and ``up`` alone
-    would recreate nothing.
+    would recreate nothing — so the services of ``own`` (this project's image)
+    are force-recreated afterwards. Third-party services (a database, a cache)
+    are never force-recreated.
     """
     env = tag_env(cfg, tag)
-    up = ["up", "-d", *(["--force-recreate"] if force else [])]
+    up = ["up", "-d"]
     protected = {p.service for p in cfg.protected}
     targets = [name for name in services if name not in protected] if protected else []
     if protected and not targets:
@@ -1705,10 +1749,23 @@ def recreate_services(
     if removed:
         write(t("removed_containers", names=", ".join(removed)))
     ok = result.code == 0
+    forced = [name for name in own if name in (targets or services)]
+    if ok and force and forced:
+        ok = (
+            executor.run(
+                compose_command(cfg, *up, "--force-recreate", "--no-deps", *forced, definition=definition),
+                cwd=cfg.checkout_path,
+                env=env,
+                capture=True,
+                echo=True,
+                timeout=1200,
+            ).code
+            == 0
+        )
     if ok and joining:
         ok = (
             executor.run(
-                compose_command(cfg, *up, *joining, definition=definition),
+                compose_command(cfg, *up, *(["--force-recreate"] if force else []), *joining, definition=definition),
                 cwd=cfg.checkout_path,
                 env=env,
                 timeout=1200,
@@ -1734,13 +1791,27 @@ def web_health(cfg: Config, executor: Executor) -> str:
     return unhealthy[0] if unhealthy else "healthy"
 
 
+UNHEALTHY_IN_A_ROW = 3
+
+
 def wait_healthy(cfg: Config, executor: Executor, clock: Callable[[], float], sleep: Callable[[float], None]) -> bool:
+    """True once every web container is healthy; False at the deadline.
+
+    Docker only reports ``unhealthy`` after the health check failed its
+    retries; seeing it ``UNHEALTHY_IN_A_ROW`` times in a row ends the wait
+    early instead of burning the whole timeout before the rollback.
+    """
     deadline = clock() + cfg.health_timeout
+    unhealthy = 0
     while True:
         status = web_health(cfg, executor)
         write(t("health_status", service=cfg.web_service, status=status))
         if status == "healthy":
             return True
+        unhealthy = unhealthy + 1 if status == "unhealthy" else 0
+        if unhealthy >= UNHEALTHY_IN_A_ROW:
+            write(t("health_gave_up", service=cfg.web_service, count=UNHEALTHY_IN_A_ROW))
+            return False
         if clock() >= deadline:
             return False
         sleep(cfg.health_interval)
@@ -2667,6 +2738,10 @@ def main(
         with group(t("step_healthcheck", service=cfg.web_service), clock):
             check_healthcheck(cfg, executor, deploy)
 
+        deploy.step = "dependencies"
+        with group(t("step_dependencies"), clock):
+            start_dependencies(cfg, executor, deploy, services)
+
         for point in ("pre_migrate", "migrate", "post_migrate"):
             deploy.step = point
             with group(t("step_hooks", point=point), clock):
@@ -2689,7 +2764,13 @@ def main(
                     write(t("republish"))
                 services_touched = True
                 recreated = recreate_services(
-                    cfg, executor, deploy.commit, services, [s.service for s, _ in joining], force=republish
+                    cfg,
+                    executor,
+                    deploy.commit,
+                    services,
+                    [s.service for s, _ in joining],
+                    force=republish,
+                    own=deploy.own,
                 )
                 if recreated:
                     for service, _ in joining:

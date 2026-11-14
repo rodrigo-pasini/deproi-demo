@@ -15,6 +15,7 @@ Use it as a reference for what a project looks like once Deproi is in place, or 
 | [`deploy/deproi.py`](deploy/deproi.py) | Deproi itself, copied unchanged from a release. Updated by pull requests from `deproi-update.yml`. |
 | [`.github/workflows/deploy-production.yml`](.github/workflows/deploy-production.yml) | Rendered by Deproi's `render-workflow.sh`, not edited. It only opens SSH; the server decides what runs. |
 | [`.github/workflows/deproi-update.yml`](.github/workflows/deproi-update.yml) | Weekly: opens a pull request when a new Deproi release exists, after verifying its checksum. |
+| [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | On every pull request: the compose file is valid, the image builds, the app becomes healthy. Required before merging. |
 | [`compose.yaml`](compose.yaml) | Profile `prod`, suffix `-prod`, `image: deproi-demo:${DEPROI_TAG}`, `init: true`, restart policy. |
 | [`Dockerfile`](Dockerfile) | `HEALTHCHECK` on `/health`: Deproi decides between success and rollback from it. |
 | [`deploy/prod.compose.env`](deploy/prod.compose.env) | `COMPOSE_PROJECT_NAME` and other non-secret values. |
@@ -29,6 +30,16 @@ Use it as a reference for what a project looks like once Deproi is in place, or 
 4. Healthy → `result: SUCCESS`. Not healthy → the previous image comes back → `result: FAILED_ROLLED_BACK`.
 
 Commit an empty file `app/BROKEN` to see a rollback: that version's `/health` returns 500.
+
+## Protecting `main`
+
+A push to `main` deploys to production, so `main` is protected like Deproi recommends:
+
+- Changes arrive by pull request (squash merge only, linear history, no force push, no deletion), and **CI** must pass.
+- The `production` environment only accepts `main`.
+- Secret scanning with push protection, Dependabot alerts and updates (Actions and the Docker base image), CodeQL.
+
+The pull request from `deproi-update.yml` starts with no checks: GitHub does not run workflows on pull requests opened with a workflow's own token. Close and reopen it to run CI.
 
 ## Try it on your own server
 

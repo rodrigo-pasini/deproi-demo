@@ -1,0 +1,43 @@
+# Checks every pull request before it can reach main (main deploys to production):
+# the compose file is valid, the image builds, and the web service becomes healthy.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and health check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      DEPROI_TAG: ci
+      COMPOSE: docker compose --env-file deploy/prod.compose.env --profile prod
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Compose definition
+        run: $COMPOSE config --quiet
+      - name: Build
+        run: $COMPOSE build
+      - name: Start and wait for the health check
+        run: $COMPOSE up -d --wait --wait-timeout 60
+      - name: Answer on /
+        run: curl -fsS http://127.0.0.1:8080/
+      - name: Logs
+        if: always()
+        run: $COMPOSE logs --no-color
+      - name: Stop
+        if: always()
+        run: $COMPOSE down -v

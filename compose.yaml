@@ -23,6 +23,10 @@ services:
     profiles: [prod]
     image: deproi-demo:${DEPROI_TAG:-local}
     command: ["python", "-u", "worker.py"]
+    # Same image as the web service: without this, it inherits the HTTP HEALTHCHECK
+    # and shows "unhealthy" forever (Deproi only waits for the web service).
+    healthcheck:
+      disable: true
     init: true
     volumes:
       - data:/data

@@ -15,6 +15,7 @@ Use como referência de como um projeto fica depois que o Deproi está no lugar,
 | [`deploy/deproi.py`](deploy/deproi.py) | O próprio Deproi, copiado sem alteração de uma release. Atualizado por pull requests do `deproi-update.yml`. |
 | [`.github/workflows/deploy-production.yml`](.github/workflows/deploy-production.yml) | Gerado pelo `render-workflow.sh` do Deproi, sem edição. Ele só abre o SSH; o servidor decide o que roda. |
 | [`.github/workflows/deproi-update.yml`](.github/workflows/deproi-update.yml) | Semanal: abre um pull request quando sai uma versão nova do Deproi, depois de conferir o checksum. |
+| [`.github/workflows/ci.yml`](.github/workflows/ci.yml) | Em todo pull request: o compose é válido, a imagem constrói, o app fica saudável. Obrigatório antes do merge. |
 | [`compose.yaml`](compose.yaml) | Perfil `prod`, sufixo `-prod`, `image: deproi-demo:${DEPROI_TAG}`, `init: true`, política de restart. |
 | [`Dockerfile`](Dockerfile) | `HEALTHCHECK` em `/health`: é por ele que o Deproi decide entre sucesso e reversão. |
 | [`deploy/prod.compose.env`](deploy/prod.compose.env) | `COMPOSE_PROJECT_NAME` e outros valores não secretos. |
@@ -29,6 +30,16 @@ Use como referência de como um projeto fica depois que o Deproi está no lugar,
 4. Saudável → `result: SUCCESS`. Não saudável → a imagem anterior volta → `result: FAILED_ROLLED_BACK`.
 
 Commite um arquivo vazio `app/BROKEN` para ver uma reversão: o `/health` dessa versão responde 500.
+
+## Protegendo a `main`
+
+Um push na `main` faz deploy em produção, então a `main` é protegida como o Deproi recomenda:
+
+- As mudanças chegam por pull request (só squash merge, histórico linear, sem force push, sem apagar a branch), e a **CI** precisa passar.
+- O environment `production` só aceita a `main`.
+- Secret scanning com push protection, alertas e atualizações do Dependabot (Actions e a imagem base do Docker), CodeQL.
+
+O pull request do `deproi-update.yml` começa sem checks: o GitHub não roda workflows em pull requests abertos com o token do próprio workflow. Feche e reabra o PR para rodar a CI.
 
 ## Teste no seu próprio servidor
 

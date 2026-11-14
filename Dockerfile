@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.15-slim
 WORKDIR /app
 COPY app/ /app/
 # A new named volume starts with this folder's owner, so the app (nobody) can write to it.

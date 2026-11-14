@@ -1,0 +1,105 @@
+# Deproi updater (https://github.com/rodrigo-pasini/deproi) — optional.
+#
+# Once a week (or by hand) compares deploy/deproi.py with the latest
+# Deproi release. When a newer version exists, it downloads deproi.py,
+# verifies it against the release's SHA256SUMS and opens a pull request.
+# Nothing is deployed by this workflow: a person reviews and merges the PR,
+# and the next deploy installs the new script on the server by itself.
+#
+# Requires: Settings → Actions → General → "Allow GitHub Actions to create and
+# approve pull requests". No third-party actions: curl, sha256sum and gh.
+
+name: Deproi update
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SCRIPT: deploy/deproi.py
+      UPSTREAM: rodrigo-pasini/deproi
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Compare with the latest release
+        id: compare
+        run: |
+          set -euo pipefail
+          current=$(sed -n 's/^DEPROI_VERSION = "\(.*\)"$/\1/p' "$SCRIPT")
+          latest=$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name | sed 's/^v//')
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          newest=$(printf '%s\n%s\n' "$current" "$latest" | sort -V | tail -n 1)
+          if [ "$current" = "$latest" ] || [ "$newest" = "$current" ]; then
+            echo "Deproi $current is up to date." >> "$GITHUB_STEP_SUMMARY"
+            echo "update=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "update=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download and verify
+        if: steps.compare.outputs.update == 'true'
+        id: download
+        env:
+          CURRENT: ${{ steps.compare.outputs.current }}
+          LATEST: ${{ steps.compare.outputs.latest }}
+        run: |
+          set -euo pipefail
+          work=$(mktemp -d)
+          base="https://github.com/$UPSTREAM/releases/download"
+          curl -fsSL "$base/v$LATEST/deproi.py" -o "$work/deproi.py"
+          curl -fsSL "$base/v$LATEST/SHA256SUMS" -o "$work/SHA256SUMS"
+          (cd "$work" && sha256sum --check --strict --ignore-missing SHA256SUMS)
+          grep -qx "DEPROI_VERSION = \"$LATEST\"" "$work/deproi.py"
+          # Was the local copy edited? Compare with the published hash of the current version.
+          modified=unknown
+          if curl -fsSL "$base/v$CURRENT/SHA256SUMS" -o "$work/CURRENT_SUMS"; then
+            if [ "$(awk '/deproi.py$/ {print $1}' "$work/CURRENT_SUMS")" = "$(sha256sum "$SCRIPT" | cut -d' ' -f1)" ]; then
+              modified=no
+            else
+              modified=yes
+            fi
+          fi
+          echo "modified=$modified" >> "$GITHUB_OUTPUT"
+          cp "$work/deproi.py" "$SCRIPT"
+
+      - name: Open the pull request
+        if: steps.compare.outputs.update == 'true'
+        env:
+          CURRENT: ${{ steps.compare.outputs.current }}
+          LATEST: ${{ steps.compare.outputs.latest }}
+          MODIFIED: ${{ steps.download.outputs.modified }}
+        run: |
+          set -euo pipefail
+          branch="deproi/update-$LATEST"
+          if gh pr list --head "$branch" --state open --json number --jq 'length' | grep -qv '^0$'; then
+            echo "A pull request for Deproi $LATEST is already open." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git add "$SCRIPT"
+          git commit -m "chore: update Deproi to $LATEST"
+          git push --force origin "$branch"
+          warning=""
+          case "$MODIFIED" in
+            yes) warning=$'\n> ⚠️ **The local deploy script was modified** (it does not match the published Deproi '"$CURRENT"$'). This PR replaces it: review carefully and move local changes to hooks.\n' ;;
+            unknown) warning=$'\n> ⚠️ Could not verify whether the local script was modified.\n' ;;
+          esac
+          body="Updates the Deproi deploy script from **$CURRENT** to **$LATEST** (verified against the release's SHA256SUMS).
+          $warning
+          - Changelog: https://github.com/$UPSTREAM/releases/tag/v$LATEST
+          - After merging, the next deploy of each environment installs the new script on the server by itself (self-update).
+          - Read the release notes for configuration changes before merging."
+          gh pr create --head "$branch" --title "chore: update Deproi to $LATEST" --body "$body"

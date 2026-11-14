@@ -1,0 +1,103 @@
+# Deproi — deploy of deproi-demo-prod (https://github.com/rodrigo-pasini/deproi)
+#
+#   push to main → this job → ssh deproi@server → the key's forced command
+#   `sudo -n /usr/local/sbin/deproi-deproi-demo-prod` → docker compose
+#
+# ⚠️ This file carries NO deploy logic, on purpose. It only opens the
+# connection: on the server, the key is locked to one command
+# (restrict,command="…") and that command is root-owned, outside the
+# checkout. A commit that changes this YAML does not change what runs with
+# privilege. No third-party actions: only the runner's ssh.
+#
+# GitHub environment "production" holds the secrets:
+#   DEPROI_SSH_KEY      private deploy key (ed25519) — only for this environment
+#   DEPROI_KNOWN_HOSTS  the server's host key line(s)
+#   DEPROI_HOST         server address
+# Optional environment variables: DEPROI_SSH_USER (default deproi),
+# DEPROI_SSH_PORT (default 22), DEPROI_PAUSED=true (skip without connecting).
+
+name: Deploy production
+
+on:
+  push:
+    branches: [main]
+  # Republishes the latest commit of the branch. No inputs.
+  workflow_dispatch:
+
+# The job needs no GITHUB_TOKEN permission.
+permissions: {}
+
+jobs:
+  deploy:
+    # A manual run from another branch ends here, without connecting.
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    # One deploy at a time; the running one finishes; a newer pending one replaces an older pending one.
+    concurrency:
+      group: deproi-deproi-demo-prod
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    # Above the script's worst case (lock + build + migrations + rollback). Only used minutes count.
+    timeout-minutes: 240
+    steps:
+      - name: Paused
+        if: vars.DEPROI_PAUSED == 'true'
+        run: echo "Deploy paused (DEPROI_PAUSED=true in environment production) — nothing was changed." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Prepare the key and the server identity
+        if: vars.DEPROI_PAUSED != 'true'
+        env:
+          DEPROI_SSH_KEY: ${{ secrets.DEPROI_SSH_KEY }}
+          DEPROI_KNOWN_HOSTS: ${{ secrets.DEPROI_KNOWN_HOSTS }}
+        run: |
+          umask 077
+          printf '%s\n' "$DEPROI_SSH_KEY" > "$RUNNER_TEMP/key"
+          printf '%s\n' "$DEPROI_KNOWN_HOSTS" > "$RUNNER_TEMP/known_hosts"
+
+      - name: Deploy on the server
+        if: vars.DEPROI_PAUSED != 'true'
+        env:
+          DEPROI_HOST: ${{ secrets.DEPROI_HOST }}
+          DEPROI_SSH_USER: ${{ vars.DEPROI_SSH_USER || 'deproi' }}
+          DEPROI_SSH_PORT: ${{ vars.DEPROI_SSH_PORT || '22' }}
+        run: |
+          set -o pipefail
+          # No remote command: the forced command in authorized_keys decides what runs.
+          ssh -i "$RUNNER_TEMP/key" \
+              -p "$DEPROI_SSH_PORT" \
+              -o IdentitiesOnly=yes \
+              -o UserKnownHostsFile="$RUNNER_TEMP/known_hosts" \
+              -o StrictHostKeyChecking=yes \
+              -o BatchMode=yes \
+              -o ServerAliveInterval=30 \
+              "$DEPROI_SSH_USER@$DEPROI_HOST" | tee "$RUNNER_TEMP/output.txt"
+          # ssh's stderr (key refused, unknown host, sudo) goes to the log but not to
+          # the file: an empty file means "did not connect".
+
+      - name: Summary
+        if: always() && vars.DEPROI_PAUSED != 'true'
+        run: |
+          rm -f "$RUNNER_TEMP/key"
+          output="$RUNNER_TEMP/output.txt"
+          result=$(grep '^result: ' "$output" 2>/dev/null | tail -n 1 || true)
+          message=$(grep '^message: ' "$output" 2>/dev/null | tail -n 1 | sed 's/^message: //' || true)
+          extras=$(grep -E '^(betterstack|cloudflare|webhook|post_deploy): ' "$output" 2>/dev/null | tail -n 4 || true)
+          {
+            echo "## Deploy production"
+            echo
+            if [ ! -s "$output" ]; then
+              echo "The server did not answer or refused the connection — nothing was changed. Check DEPROI_HOST, DEPROI_SSH_KEY and DEPROI_KNOWN_HOSTS in environment production."
+            elif [ -z "$result" ]; then
+              echo "The connection dropped during the deploy — the server finishes on its own. Check it with: journalctl -t deproi-deproi-demo-prod"
+            else
+              echo "$message"
+              echo
+              echo '```'
+              echo "$result"
+              echo '```'
+              if [ -n "$extras" ]; then
+                echo
+                while IFS= read -r line; do echo "- $line"; done <<< "$extras"
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,32 @@
+# Deproi demo — the contract a project follows (https://github.com/rodrigo-pasini/deproi):
+#   - every service of an environment has its profile and the environment suffix (-prod);
+#   - built services use image: <image>:${DEPROI_TAG} (Deproi sets the commit tag);
+#   - the web service has a health check (here, in the Dockerfile).
+services:
+  web-prod:
+    profiles: [prod]
+    build: .
+    image: deproi-demo:${DEPROI_TAG:-local}
+    # A tiny init as PID 1 forwards SIGTERM, so the container stops at once instead of
+    # waiting Docker's 10 s timeout on every recreate.
+    init: true
+    environment:
+      APP_VERSION: ${DEPROI_TAG:-local}
+      GREETING: ${GREETING:-hello}
+    volumes:
+      - data:/data
+    ports:
+      - "${WEB_PORT:-8080}:8000"
+    restart: unless-stopped
+
+  worker-prod:
+    profiles: [prod]
+    image: deproi-demo:${DEPROI_TAG:-local}
+    command: ["python", "-u", "worker.py"]
+    init: true
+    volumes:
+      - data:/data
+    restart: unless-stopped
+
+volumes:
+  data:
